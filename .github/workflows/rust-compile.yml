@@ -1,0 +1,275 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+name: Rust Cloud Cross Compiler
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository_url:
+        description: "Git repository URL"
+        required: true
+        type: string
+
+      ref:
+        description: "Branch / Tag / Commit (optional)"
+        required: false
+        default: ""
+        type: string
+
+      target:
+        description: "Rust target triple"
+        required: true
+        type: choice
+        options:
+          # Tier 1 - Linux
+          - x86_64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-gnu
+          - aarch64-unknown-linux-musl
+          # Tier 1 - Windows
+          - x86_64-pc-windows-gnu
+          - x86_64-pc-windows-msvc
+          # Tier 1 - macOS
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+          # Tier 2 - Mobile / Embedded
+          - aarch64-linux-android
+          - armv7-linux-androideabi
+          - x86_64-linux-android
+          - i686-linux-android
+          - armv7-unknown-linux-gnueabihf
+          - riscv64gc-unknown-linux-gnu
+          # WebAssembly
+          - wasm32-unknown-unknown
+          - wasm32-wasi
+        default: x86_64-unknown-linux-gnu
+
+      build_options:
+        description: "Extra cargo options (e.g. --features feat1)"
+        required: false
+        default: ""
+        type: string
+
+      use_cross:
+        description: "Force use cross-rs Docker compiler"
+        required: false
+        default: false
+        type: boolean
+
+env:
+  TARGET: ${{ inputs.target }}
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  BUILD_OPTS: ${{ inputs.build_options }}
+
+jobs:
+  build:
+    name: Build ${{ inputs.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      status: ${{ steps.compile.outcome }}
+
+    steps:
+      ################################################
+      # Checkout
+      ################################################
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository_url }}
+          ref: ${{ inputs.ref }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      ################################################
+      # Rust setup
+      ################################################
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ inputs.target }}
+          components: rust-src
+
+      ################################################
+      # Setup Android NDK (for Android targets)
+      ################################################
+      # - name: Setup Android NDK
+      #   if: contains(inputs.target, 'android')
+      #   run: |
+      #     # Install Android NDK
+      #     NDK_VERSION="r26b"
+      #     wget -q "https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip" -O ndk.zip
+      #     unzip -q ndk.zip -d "$HOME"
+      #     rm ndk.zip
+      #     echo "ANDROID_NDK_HOME=$HOME/android-ndk-${NDK_VERSION}" >> $GITHUB_ENV
+      #     echo "$HOME/android-ndk-${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+
+      ################################################
+      # Cache (lenient - works with or without Cargo.lock)
+      ################################################
+      - name: Cache Cargo registry & index
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('source/**/Cargo.lock', 'source/**/Cargo.toml') }}
+          restore-keys: |
+            cargo-registry-${{ runner.os }}-${{ hashFiles('source/**/Cargo.toml') }}
+            cargo-registry-${{ runner.os }}-
+
+      - name: Cache Cargo build
+        uses: actions/cache@v4
+        with:
+          path: source/target
+          key: cargo-build-${{ inputs.target }}-${{ hashFiles('source/**/Cargo.lock', 'source/**/Cargo.toml') }}-${{ github.run_id }}
+          restore-keys: |
+            cargo-build-${{ inputs.target }}-${{ hashFiles('source/**/Cargo.lock', 'source/**/Cargo.toml') }}-
+            cargo-build-${{ inputs.target }}-${{ hashFiles('source/**/Cargo.toml') }}-
+            cargo-build-${{ inputs.target }}-
+
+      ################################################
+      # Install cross (when needed)
+      ################################################
+      - name: Install cross compiler
+        if: inputs.use_cross == true || contains(inputs.target, 'apple') || contains(inputs.target, 'windows') || contains(inputs.target, 'arm') || contains(inputs.target, 'aarch64') || contains(inputs.target, 'riscv') || contains(inputs.target, 'android')
+        run: |
+          CROSS_VERSION="0.2.5"
+          curl -L "https://github.com/cross-rs/cross/releases/download/v${CROSS_VERSION}/cross-x86_64-unknown-linux-gnu.tar.gz" | tar xz -C /usr/local/bin
+          cross --version
+
+      ################################################
+      # Build
+      ################################################
+      - name: Build project
+        id: compile
+        continue-on-error: true
+        working-directory: source
+        run: |
+          mkdir -p ../result
+          echo "TARGET=$TARGET"
+          echo "BUILD_OPTS=$BUILD_OPTS"
+
+          USE_CROSS="${{ inputs.use_cross }}"
+          if command -v cross >/dev/null 2>&1; then
+            HAS_CROSS="true"
+          else
+            HAS_CROSS="false"
+          fi
+
+          if [ "$USE_CROSS" = "true" ] || [ "$HAS_CROSS" = "true" ]; then
+            echo "Using cross"
+            cross build --release --target "$TARGET" $BUILD_OPTS
+          else
+            echo "Using cargo"
+            cargo build --release --target "$TARGET" $BUILD_OPTS
+          fi
+
+      ################################################
+      # Collect output
+      ################################################
+      - name: Collect binaries
+        if: always()
+        run: |
+          mkdir -p result/bin
+          RELEASE="source/target/$TARGET/release"
+          echo "Scanning $RELEASE"
+
+          if [ ! -d "$RELEASE" ]; then
+            echo "WARNING: Release directory not found"
+            ls -la source/target/ 2>/dev/null || true
+          fi
+
+          if [ -d "$RELEASE" ]; then
+            # Collect all executable-like files
+            find "$RELEASE" -maxdepth 1 -type f \( -perm /111 -o -name "*.exe" \) -print0 | while IFS= read -r -d '' file; do
+              echo "Found binary: $file"
+              cp "$file" result/bin/
+            done
+
+            # Collect other artifact types
+            find "$RELEASE" -maxdepth 1 -type f -name "*.wasm" -exec cp {} result/bin/ \; || true
+            find "$RELEASE" -maxdepth 1 -type f \( -name "*.so" -o -name "*.dylib" -o -name "*.dll" -o -name "*.a" -o -name "*.lib" \) -exec cp {} result/bin/ \; || true
+          fi
+
+          echo "=== Collected artifacts ==="
+          ls -lah result/bin/ 2>/dev/null || echo "No binaries found"
+
+      ################################################
+      # Metadata
+      ################################################
+      - name: Generate build information
+        if: always()
+        run: |
+          cat > result/build-info.txt <<EOF
+          ============================================
+          Rust Cloud Cross Compiler Build Report
+          ============================================
+          Repository:    ${{ inputs.repository_url }}
+          Ref:           ${{ inputs.ref || 'default branch' }}
+          Target:        ${TARGET}
+          Cross Used:    ${{ inputs.use_cross }}
+
+          Toolchain:
+            Rustc:       $(rustc --version)
+            Cargo:       $(cargo --version)
+
+          Build Time:    $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          Build Status:  ${{ steps.compile.outcome }}
+          ============================================
+          EOF
+
+      ################################################
+      # Compress & Checksum
+      ################################################
+      - name: Create archive
+        if: always()
+        run: |
+          cd result
+          SAFE_TARGET=$(echo "$TARGET" | tr '/' '-')
+          tar czf "rust-${SAFE_TARGET}.tar.gz" bin build-info.txt
+          ls -lah "rust-${SAFE_TARGET}.tar.gz"
+
+      - name: Generate checksum
+        if: always()
+        run: |
+          cd result
+          SAFE_TARGET=$(echo "$TARGET" | tr '/' '-')
+          sha256sum "rust-${SAFE_TARGET}.tar.gz" > SHA256SUM
+          cat SHA256SUM
+
+      ################################################
+      # Upload artifact
+      ################################################
+      - name: Upload Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-${{ inputs.target }}
+          path: |
+            result/*.tar.gz
+            result/SHA256SUM
+            result/build-info.txt
+          if-no-files-found: warn
+          retention-days: 30
+
+      ################################################
+      # Final status
+      ################################################
+      - name: Build summary
+        if: always()
+        run: |
+          echo ""
+          echo "╔════════════════════════════════════════════╗"
+          echo "║         BUILD SUMMARY                      ║"
+          echo "╠════════════════════════════════════════════╣"
+          if [ "${{ steps.compile.outcome }}" = "success" ]; then
+            echo "║  Status:      ✅ SUCCESS                   ║"
+          else
+            echo "║  Status:      ❌ FAILED                    ║"
+          fi
+          echo "║  Target:      ${TARGET}                    ║"
+          echo "║  Artifact:     rust-${TARGET}              ║"
+          echo "╚════════════════════════════════════════════╝"
