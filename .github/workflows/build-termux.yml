@@ -1,0 +1,211 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+name: Rust Cloud Termux Compiler
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository_url:
+        description: "Git repository URL"
+        required: true
+        type: string
+
+      ref:
+        description: "Branch / Tag / Commit (optional)"
+        required: false
+        default: ""
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  TARGET: aarch64-linux-android
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      status: ${{ steps.compile.outcome }}
+
+    steps:
+      ################################################
+      # Checkout
+      ################################################
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.repository_url }}
+          ref: ${{ inputs.ref }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      ################################################
+      # Rust setup
+      ################################################
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+          components: rust-src
+
+      ################################################
+      # Cache (lenient - works with or without Cargo.lock)
+      ################################################
+      - name: Cache Cargo registry & index
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('source/**/Cargo.lock', 'source/**/Cargo.toml') }}
+          restore-keys: |
+            cargo-registry-${{ runner.os }}-${{ hashFiles('source/**/Cargo.toml') }}
+            cargo-registry-${{ runner.os }}-
+
+      - name: Cache Cargo build
+        uses: actions/cache@v4
+        with:
+          path: source/target
+          key: cargo-build-aarch64-linux-android-${{ hashFiles('source/**/Cargo.lock', 'source/**/Cargo.toml') }}-${{ github.run_id }}
+          restore-keys: |
+            cargo-build-aarch64-linux-android-${{ hashFiles('source/**/Cargo.lock', 'source/**/Cargo.toml') }}-
+            cargo-build-aarch64-linux-android-${{ hashFiles('source/**/Cargo.toml') }}-
+            cargo-build-aarch64-linux-android-
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      ################################################
+      # Build
+      ################################################
+      - name: Build project
+        id: compile
+        continue-on-error: true
+        working-directory: source
+        run: |
+          mkdir -p ../result
+
+          source <(cargo ndk-env)
+
+          echo $CARGO_NDK_ANDROID_PLATFORM
+          echo $CARGO_NDK_NDK_VERSION
+          echo $CARGO_NDK_OUTPUT_PATH
+          echo $CARGO_NDK_SYSROOT_PATH
+          echo $CARGO_NDK_SYSROOT_TARGET
+          echo $CARGO_NDK_SYSROOT_LIBS_PATH
+          echo $LIBCLANG_PATH
+          echo $ANDROID_PLATFORM
+          echo $ANDROID_ABI
+
+
+          cargo ndk -t $TARGET build --release
+
+      ################################################
+      # Collect output
+      ################################################
+      - name: Collect binaries
+        if: always()
+        run: |
+          mkdir -p result/bin
+          RELEASE="source/target/$TARGET/release"
+          echo "Scanning $RELEASE"
+
+          if [ ! -d "$RELEASE" ]; then
+            echo "WARNING: Release directory not found"
+            ls -la source/target/ 2>/dev/null || true
+          fi
+
+          if [ -d "$RELEASE" ]; then
+            # Collect all executable-like files
+            find "$RELEASE" -maxdepth 1 -type f \( -perm /111 -o -name "*.exe" \) -print0 | while IFS= read -r -d '' file; do
+              echo "Found binary: $file"
+              cp "$file" result/bin/
+            done
+
+            # Collect other artifact types
+            find "$RELEASE" -maxdepth 1 -type f -name "*.wasm" -exec cp {} result/bin/ \; || true
+            find "$RELEASE" -maxdepth 1 -type f \( -name "*.so" -o -name "*.dylib" -o -name "*.dll" -o -name "*.a" -o -name "*.lib" \) -exec cp {} result/bin/ \; || true
+          fi
+
+          echo "=== Collected artifacts ==="
+          ls -lah result/bin/ 2>/dev/null || echo "No binaries found"
+
+      ################################################
+      # Metadata
+      ################################################
+      - name: Generate build information
+        if: always()
+        run: |
+          cat > result/build-info.txt <<EOF
+          ============================================
+          Rust Cloud Cross Compiler Build Report
+          ============================================
+          Repository:    ${{ inputs.repository_url }}
+          Ref:           ${{ inputs.ref || 'default branch' }}
+          Target:        ${TARGET}
+
+          Toolchain:
+            Rustc:       $(rustc --version)
+            Cargo:       $(cargo --version)
+
+          Build Time:    $(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          Build Status:  ${{ steps.compile.outcome }}
+          ============================================
+          EOF
+
+      ################################################
+      # Compress & Checksum
+      ################################################
+      - name: Create archive
+        if: always()
+        run: |
+          cd result
+          SAFE_TARGET=$(echo "$TARGET" | tr '/' '-')
+          tar czf "rust-${SAFE_TARGET}.tar.gz" bin build-info.txt
+          ls -lah "rust-${SAFE_TARGET}.tar.gz"
+
+      - name: Generate checksum
+        if: always()
+        run: |
+          cd result
+          SAFE_TARGET=$(echo "$TARGET" | tr '/' '-')
+          sha256sum "rust-${SAFE_TARGET}.tar.gz" > SHA256SUM
+          cat SHA256SUM
+
+      ################################################
+      # Upload artifact
+      ################################################
+      - name: Upload Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-aarch64-linux-android
+          path: |
+            result/*.tar.gz
+            result/SHA256SUM
+            result/build-info.txt
+          if-no-files-found: warn
+          retention-days: 30
+
+      ################################################
+      # Final status
+      ################################################
+      - name: Build summary
+        if: always()
+        run: |
+          echo ""
+          echo "╔════════════════════════════════════════════╗"
+          echo "║         BUILD SUMMARY                      ║"
+          echo "╠════════════════════════════════════════════╣"
+          if [ "${{ steps.compile.outcome }}" = "success" ]; then
+            echo "║  Status:      ✅ SUCCESS                   ║"
+          else
+            echo "║  Status:      ❌ FAILED                    ║"
+          fi
+          echo "║  Target:      ${TARGET}                    ║"
+          echo "║  Artifact:     rust-${TARGET}              ║"
+          echo "╚════════════════════════════════════════════╝"
